@@ -67,11 +67,19 @@ class SinePositionalEncoding3D(BaseModule):
         """
         # For convenience of exporting to ONNX, it's required to convert
         # `masks` from bool to int.
+        # mask的形状是[B,N,H,W]
+        # mask的数值转成整型，0或1
         mask = mask.to(torch.int)
+        # mask取反
         not_mask = 1 - mask  # logical_not
+        # 沿着第1维度进行累加，形状不变，但每个元素是该位置及之前所有元素的累积和
         n_embed = not_mask.cumsum(1, dtype=torch.float32)
+        # 沿着第2维度进行累加，形状不变，但每个元素是该位置及之前所有元素的累积和
         y_embed = not_mask.cumsum(2, dtype=torch.float32)
+        # 沿着第3维度进行累加，形状不变，但每个元素是该位置及之前所有元素的累积和
         x_embed = not_mask.cumsum(3, dtype=torch.float32)
+        # 分别对n_embed, y_embed, x_embed进行归一化，然后乘以scale
+        # scale是2*pi，相当于是把n_embed, y_embed, x_embed归一化到[0, 2*pi]之间，为后续计算sin和cos做准备
         if self.normalize:
             n_embed = (n_embed + self.offset) / \
                       (n_embed[:, -1:, :, :] + self.eps) * self.scale
@@ -79,14 +87,22 @@ class SinePositionalEncoding3D(BaseModule):
                       (y_embed[:, :, -1:, :] + self.eps) * self.scale
             x_embed = (x_embed + self.offset) / \
                       (x_embed[:, :, :, -1:] + self.eps) * self.scale
+        # 构造[0~128)的等差数列，num_feats=128
         dim_t = torch.arange(
             self.num_feats, dtype=torch.float32, device=mask.device)
+        # 构造以10000为底，以dim_t/128为指数的数列，实际是0~8000左右的一个数列，形状像底数大于1的指数函数，刚开始增加的慢，后面增加的快
         dim_t = self.temperature**(2 * (dim_t // 2) / self.num_feats)
+        # 将n_embed扩展一个维度，形状变为[B, N, H, W, 1]，
+        # 最后一个维度的每个值除以dim_t中的每个值，形状变成[B, N, H, W, num_feats]
+        # 由于dim_t是一个递增序列，pos_n的最后一个维度是一个递减序列
         pos_n = n_embed[:, :, :, :, None] / dim_t
         pos_x = x_embed[:, :, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, :, None] / dim_t
         # use `view` instead of `flatten` for dynamically exporting to ONNX
         B, N, H, W = mask.size()
+        # pos_n的形状是[B, N, H, W, num_feats]
+        # 取pos_n最后一个维度的偶数位和奇数位，分别进行sin和cos运算，然后在最后一个维度上进行叠加
+        # 最后将形状重新设定为[B, N, H, W, -1]，使偶数的sin和奇数的cos叠加到一个维度中，形状不变
         pos_n = torch.stack(
             (pos_n[:, :, :, :, 0::2].sin(), pos_n[:, :, :, :, 1::2].cos()),
             dim=4).view(B, N, H, W, -1)
@@ -96,6 +112,8 @@ class SinePositionalEncoding3D(BaseModule):
         pos_y = torch.stack(
             (pos_y[:, :, :, :, 0::2].sin(), pos_y[:, :, :, :, 1::2].cos()),
             dim=4).view(B, N, H, W, -1)
+        # 将pos_n, pos_y, pos_x在最后一个维度上进行拼接，形状变为[B, N, H, W, num_feats*3]
+        # 然后对维度顺序进行调整，形状变成[B, N, num_feats*3, H, W]，其中num_feats*3=384
         pos = torch.cat((pos_n, pos_y, pos_x), dim=4).permute(0, 1, 4, 2, 3)
         return pos
 

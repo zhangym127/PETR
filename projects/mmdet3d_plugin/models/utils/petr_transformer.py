@@ -88,7 +88,9 @@ class PETRTransformer(BaseModule):
                       [bs, embed_dims, h, w].
         """
         bs, n, c, h, w = x.shape
+        # 把2D图像特征展平，形状从[B, N, C, H, W]变成[N*H*W, B, C]
         memory = x.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
+        # 把位置嵌入展平，形状从[B, N, C, H, W]变成[N*H*W, B, C]
         pos_embed = pos_embed.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
         query_embed = query_embed.unsqueeze(1).repeat(
             1, bs, 1)  # [num_query, dim] -> [num_query, bs, dim]

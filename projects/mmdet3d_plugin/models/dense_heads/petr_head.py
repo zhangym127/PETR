@@ -29,7 +29,9 @@ from mmdet.models.utils import NormedLinear
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
+    # 生成[0~128)的等差数列
     dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+    # 生成以10000为底，以dim_t/128为指数的数列
     dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
     pos_x = pos[..., 0, None] / dim_t
     pos_y = pos[..., 1, None] / dim_t
@@ -279,6 +281,7 @@ class PETRHead(AnchorFreeHead):
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
+    # @info 生成相机坐标系下的视椎体坐标，转到lidar坐标系下，再通过卷积网络转成位置嵌入（编码）
     def position_embeding(self, img_feats, img_metas, masks=None):
         eps = 1e-5
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
@@ -286,21 +289,30 @@ class PETRHead(AnchorFreeHead):
         coords_h = torch.arange(H, device=img_feats[0].device).float() * pad_h / H
         coords_w = torch.arange(W, device=img_feats[0].device).float() * pad_w / W
 
+        # 构造深度坐标
         if self.LID:
             index  = torch.arange(start=0, end=self.depth_num, step=1, device=img_feats[0].device).float()
             index_1 = index + 1
             bin_size = (self.position_range[3] - self.depth_start) / (self.depth_num * (1 + self.depth_num))
             coords_d = self.depth_start + bin_size * index * index_1
         else:
+            # position_range = [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+            # depth_start = 1
+            # 
+            # 构造[0~64)的等差数列，depth_num = 64
             index  = torch.arange(start=0, end=self.depth_num, step=1, device=img_feats[0].device).float()
+            # 比照X轴的尺度，确定深度方向上每个单元格的深度值
             bin_size = (self.position_range[3] - self.depth_start) / self.depth_num
+            # 构造深度坐标
             coords_d = self.depth_start + bin_size * index
 
+        # 构造相机坐标系下的视椎体坐标
         D = coords_d.shape[0]
         coords = torch.stack(torch.meshgrid([coords_w, coords_h, coords_d])).permute(1, 2, 3, 0) # W, H, D, 3
         coords = torch.cat((coords, torch.ones_like(coords[..., :1])), -1)
         coords[..., :2] = coords[..., :2] * torch.maximum(coords[..., 2:3], torch.ones_like(coords[..., 2:3])*eps)
 
+        # 提取相机坐标系到lidar坐标系的变换矩阵
         img2lidars = []
         for img_meta in img_metas:
             img2lidar = []
@@ -310,20 +322,25 @@ class PETRHead(AnchorFreeHead):
         img2lidars = np.asarray(img2lidars)
         img2lidars = coords.new_tensor(img2lidars) # (B, N, 4, 4)
 
+        # 将坐标从图像坐标系转换到lidar坐标系
         coords = coords.view(1, 1, W, H, D, 4, 1).repeat(B, N, 1, 1, 1, 1, 1)
         img2lidars = img2lidars.view(B, N, 1, 1, 1, 4, 4).repeat(1, 1, W, H, D, 1, 1)
         coords3d = torch.matmul(img2lidars, coords).squeeze(-1)[..., :3]
+        # 对坐标进行归一化
         coords3d[..., 0:1] = (coords3d[..., 0:1] - self.position_range[0]) / (self.position_range[3] - self.position_range[0])
         coords3d[..., 1:2] = (coords3d[..., 1:2] - self.position_range[1]) / (self.position_range[4] - self.position_range[1])
         coords3d[..., 2:3] = (coords3d[..., 2:3] - self.position_range[2]) / (self.position_range[5] - self.position_range[2])
 
+        # 设置掩码，将投影后超出边界的坐标置为无效，但是并没有用到
         coords_mask = (coords3d > 1.0) | (coords3d < 0.0) 
         coords_mask = coords_mask.flatten(-2).sum(-1) > (D * 0.5)
         coords_mask = masks | coords_mask.permute(0, 1, 3, 2)
         coords3d = coords3d.permute(0, 1, 4, 5, 3, 2).contiguous().view(B*N, -1, H, W)
+        # 使用逆sigmoid函数对坐标进行编码
         coords3d = inverse_sigmoid(coords3d)
+        # 把坐标通过卷积网络成位置嵌入（编码）
         coords_position_embeding = self.position_encoder(coords3d)
-        
+        # 最后返回位置嵌入（编码），形状是[B,N,C,H,W]，C是embed_dims=256
         return coords_position_embeding.view(B, N, self.embed_dims, H, W), coords_mask
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -370,28 +387,43 @@ class PETRHead(AnchorFreeHead):
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
         """
-        
+        # mlvl_feats是一个元组，元组中的每个元素是一个Tensor，形状是[B,N,C,H,W]
         x = mlvl_feats[0]
         batch_size, num_cams = x.size(0), x.size(1)
         input_img_h, input_img_w, _ = img_metas[0]['pad_shape'][0]
+        # 创建掩码，掩码的作用是将图像中的有效区域置为0，无效区域置为1
+        # 初始值全为1，即全为无效区域
+        # masks的形状是[B,N,H,W]，其中N是相机的数量
         masks = x.new_ones(
             (batch_size, num_cams, input_img_h, input_img_w))
+        # 将图像中的有效区域置为0
         for img_id in range(batch_size):
             for cam_id in range(num_cams):
                 img_h, img_w, _ = img_metas[img_id]['img_shape'][cam_id]
                 masks[img_id, cam_id, :img_h, :img_w] = 0
+
+        # 将输入的特征的第0维和第1维合并，即将B和N合并，形状变成[B*N,C,H,W]
+        # 然后通过卷积网络，将特征的通道数变成embed_dims
         x = self.input_proj(x.flatten(0,1))
+        # 将特征的第0维和第1维分开，即将B和N分开，形状变成[B,N,C,H,W]
         x = x.view(batch_size, num_cams, *x.shape[-3:])
+        # 对掩码进行插值，使得掩码最后两个维度尺寸与x相同，即[B,N,H,W]
         # interpolate masks to have the same spatial shape with x
         masks = F.interpolate(
             masks, size=x.shape[-2:]).to(torch.bool)
 
         if self.with_position:
+            # 生成相机坐标系下的视椎体坐标，转到lidar坐标系下，再通过卷积网络转成位置嵌入（编码）
+            # 获取的位置编码形状是[B, N, C, H, W]，其中C是embed_dims=256
             coords_position_embeding, _ = self.position_embeding(mlvl_feats, img_metas, masks)
             pos_embed = coords_position_embeding
             if self.with_multiview:
+                # 调用SinePositionalEncoding3D方法生成Sin位置编码，形状是[B, N, C, H, W]，其中C=384
                 sin_embed = self.positional_encoding(masks)
+                # 通过卷积网络转成位置嵌入（编码）
+                # 转换后的形状是[B, N, C, H, W]，其中C=256，与位置编码形状一致
                 sin_embed = self.adapt_pos3d(sin_embed.flatten(0, 1)).view(x.size())
+                # 将两种位置嵌入（编码）相加
                 pos_embed = pos_embed + sin_embed
             else:
                 pos_embeds = []
@@ -412,10 +444,18 @@ class PETRHead(AnchorFreeHead):
                     pos_embeds.append(pos_embed.unsqueeze(1))
                 pos_embed = torch.cat(pos_embeds, 1)
 
+        # 获得参考点，是可学习的参数，就是目标的坐标，形状是[num_query, 3]，num_query=900，也就是拟定的初始目标的数量是900个
         reference_points = self.reference_points.weight
+        # 把参考点转换成查询嵌入（编码）
         query_embeds = self.query_embedding(pos2posemb3d(reference_points))
         reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1) #.sigmoid()
 
+        # 通过transformer提取特征
+        # 位置嵌入以key_pos的方式给到解码器，只在交叉注意力中使用，加到key上
+        # 查询嵌入以query_pos的方式给到解码器，进入BaseTransformerLayer的forward函数后：
+        #     在进入自注意力时，query_pos又同时给到query_pos和key_pos，分别加到query和key上
+        #     在进入交叉注意力时，query_pos只给到query_pos，加到query上
+        # 查询嵌入对应于待检测的目标，位置嵌入对应于输入特征图
         outs_dec, _ = self.transformer(x, masks, query_embeds, pos_embed, self.reg_branches)
         outs_dec = torch.nan_to_num(outs_dec)
         outputs_classes = []
@@ -423,9 +463,11 @@ class PETRHead(AnchorFreeHead):
         for lvl in range(outs_dec.shape[0]):
             reference = inverse_sigmoid(reference_points.clone())
             assert reference.shape[-1] == 3
+            # 对解码器的输出进行分类和回归，回归的结果是相对于参考点的偏移量
             outputs_class = self.cls_branches[lvl](outs_dec[lvl])
             tmp = self.reg_branches[lvl](outs_dec[lvl])
 
+            # 在回归输出中加上参考点，得到预测的中心点坐标
             tmp[..., 0:2] += reference[..., 0:2]
             tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
             tmp[..., 4:5] += reference[..., 2:3]
