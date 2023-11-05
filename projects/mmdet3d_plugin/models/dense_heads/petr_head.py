@@ -26,6 +26,10 @@ import numpy as np
 from mmcv.cnn import xavier_init, constant_init, kaiming_init
 import math
 from mmdet.models.utils import NormedLinear
+
+# 对参考点进行位置编码，把参考点映射到高频空间
+# 原本参考点是三维的：[x, y, z]，现在映射到高频空间后，变成了128×3维的向量
+# 这样映射的目的是为了让模型对参考点的位置更敏感，对图像的细部特征更敏感
 def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
